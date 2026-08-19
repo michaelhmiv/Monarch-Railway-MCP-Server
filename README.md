@@ -23,6 +23,7 @@ This repository includes a Railway-friendly HTTP wrapper. It adds a small setup 
 3. Optional but recommended: attach a Railway volume at `/data` and set `MONARCH_MCP_SESSION_DIR=/data/monarch`. Without a volume, Railway's local filesystem is ephemeral and the saved Monarch session can disappear on a redeploy.
 4. Open the generated Railway domain, enter the access code, and choose a Monarch authentication method.
 5. Use the MCP endpoint at `https://YOUR-RAILWAY-DOMAIN/mcp`. Keep the endpoint protected; do not configure it as a no-auth public server after connecting a Monarch account.
+6. For OAuth-capable MCP clients, choose OAuth for the remote server. The client will discover the OAuth endpoints automatically; the authorization page asks for the same Railway access code. Clients that support custom headers may instead send `Authorization: Bearer <access code>`.
 
 This is intentionally not a multi-tenant service: one deployment stores one Monarch session. For a community-hosted multi-user service, add per-user OAuth and isolated session storage before accepting anyone else's credentials.
 
@@ -469,9 +470,11 @@ monarch-mcp-server/
 │   ├── client.py          # Cached MonarchMoney client factory
 │   ├── monarch_auth.py    # Current Monarch auth compatibility (host, email OTP, device-uuid)
 │   ├── secure_session.py  # Keyring-backed token storage (file fallback)
+│   ├── web.py             # Railway setup UI, OAuth, and protected Streamable HTTP
 │   ├── server.py          # Backward-compatibility shim re-exporting the tools
 │   └── tools/             # MCP tools grouped by domain (accounts, transactions, budgets, …)
 ├── login_setup.py         # Terminal authentication script
+├── railway.toml            # Railway build, start, and healthcheck configuration
 ├── pyproject.toml         # Project configuration
 ├── requirements.txt       # Dependencies
 └── README.md             # This documentation
