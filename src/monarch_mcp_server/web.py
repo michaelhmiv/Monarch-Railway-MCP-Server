@@ -22,7 +22,7 @@ import os
 import secrets
 import time
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 import uvicorn
 from monarchmoney import CaptchaRequiredException, RequireMFAException
@@ -38,6 +38,7 @@ from monarch_mcp_server.monarch_auth import (
     login_with_browser_cookies,
     login_with_current_auth,
 )
+from monarch_mcp_server.oauth_state import load_oauth_state, save_oauth_state
 from monarch_mcp_server.secure_session import secure_session
 from monarch_mcp_server.tool_metadata import tool_catalog
 
@@ -54,12 +55,44 @@ _COOKIE_TTL_SECONDS = 24 * 60 * 60
 _OAUTH_CODE_TTL_SECONDS = 5 * 60
 _OAUTH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60
 
-# OAuth state is intentionally in memory. This is a single-user deployment,
-# and a restart invalidates outstanding OAuth codes/tokens so the client must
-# authorize again. Monarch's own session remains in secure_session storage.
-_oauth_clients: dict[str, set[str]] = {}
-_oauth_codes: dict[str, dict[str, Any]] = {}
-_oauth_tokens: dict[str, float] = {}
+# OAuth state is persisted alongside the Monarch session. This preserves
+# existing ChatGPT client registrations and bearer tokens across deployments
+# when MONARCH_MCP_SESSION_DIR is backed by a Railway volume.
+_oauth_store = load_oauth_state()
+_oauth_clients: dict[str, set[str]] = {
+    str(client_id): {str(uri) for uri in redirect_uris}
+    for client_id, redirect_uris in _oauth_store["clients"].items()
+    if isinstance(redirect_uris, list)
+}
+_oauth_codes: dict[str, dict[str, Any]] = {
+    str(code): record
+    for code, record in _oauth_store["codes"].items()
+    if isinstance(record, dict)
+}
+_oauth_tokens: dict[str, float] = {
+    str(token): float(expires_at)
+    for token, expires_at in _oauth_store["tokens"].items()
+    if isinstance(expires_at, (int, float))
+}
+
+
+def _save_oauth_state() -> None:
+    save_oauth_state(
+        {
+            "clients": {client_id: sorted(uris) for client_id, uris in _oauth_clients.items()},
+            "codes": _oauth_codes,
+            "tokens": _oauth_tokens,
+        }
+    )
+
+
+def _is_chatgpt_redirect_uri(value: str) -> bool:
+    parsed = urlparse(value)
+    return (
+        parsed.scheme == "https"
+        and parsed.netloc == "chatgpt.com"
+        and parsed.path.startswith("/connector/oauth/")
+    )
 
 
 def _access_code() -> str:
@@ -118,6 +151,7 @@ def _has_access(request: Request) -> bool:
         return False
     if expires_at <= time.time():
         _oauth_tokens.pop(token, None)
+        _save_oauth_state()
         return False
     return True
 
@@ -228,6 +262,7 @@ async def oauth_register(request: Request) -> JSONResponse:
         )
     client_id = f"mcp_{secrets.token_urlsafe(18)}"
     _oauth_clients[client_id] = {str(uri) for uri in redirect_uris}
+    _save_oauth_state()
     return JSONResponse(
         {
             "client_id": client_id,
@@ -267,6 +302,12 @@ async def oauth_authorize(request: Request) -> Response:
     client_id = str(data.get("client_id", ""))
     redirect_uri = str(data.get("redirect_uri", ""))
     state = str(data.get("state", "")) or None
+    # ChatGPT can reuse a previously registered client ID after a server
+    # restart. Recover only its known connector redirect shape; all other
+    # clients must use dynamic registration as normal.
+    if client_id not in _oauth_clients and _is_chatgpt_redirect_uri(redirect_uri):
+        _oauth_clients[client_id] = {redirect_uri}
+        _save_oauth_state()
     if client_id not in _oauth_clients or redirect_uri not in _oauth_clients[client_id]:
         return _page("Authorize Monarch MCP", "<h1>Invalid OAuth client.</h1>", message="The client or redirect URI was not registered.")
     if str(data.get("response_type", "")) != "code":
@@ -295,6 +336,7 @@ async def oauth_authorize(request: Request) -> Response:
         "scope": str(data.get("scope", "monarch")),
         "expires_at": time.time() + _OAUTH_CODE_TTL_SECONDS,
     }
+    _save_oauth_state()
     params = {"code": authorization_code}
     if state:
         params["state"] = state
@@ -307,6 +349,7 @@ async def oauth_token(request: Request) -> JSONResponse:
         return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
     code = str(data.get("code", ""))
     record = _oauth_codes.pop(code, None)
+    _save_oauth_state()
     if not record or record["expires_at"] <= time.time():
         return JSONResponse({"error": "invalid_grant"}, status_code=400)
     if record["client_id"] != str(data.get("client_id", "")) or record["redirect_uri"] != str(data.get("redirect_uri", "")):
@@ -317,6 +360,7 @@ async def oauth_token(request: Request) -> JSONResponse:
         return JSONResponse({"error": "invalid_grant"}, status_code=400)
     access_token = f"mcp_{secrets.token_urlsafe(32)}"
     _oauth_tokens[access_token] = time.time() + _OAUTH_TOKEN_TTL_SECONDS
+    _save_oauth_state()
     return JSONResponse(
         {
             "access_token": access_token,
@@ -350,7 +394,7 @@ async def home(request: Request) -> HTMLResponse:
 <div class="card"><h2>Monarch status</h2><p>{_auth_status()}</p><a href="/auth">Open authentication</a></div>
 <div class="card"><h2>MCP connection</h2><p>Endpoint: <code>{html.escape(_external_base_url(request))}/mcp</code></p><p class="small">For a client that supports custom bearer headers, send <code>Authorization: Bearer &lt;your access code&gt;</code>. Do not configure this server as unauthenticated once it has a Monarch session.</p></div>
 <div class="card"><h2>Available tools</h2><p>{len(tool_catalog(mcp))} finance tools are registered and advertised through MCP.</p><p><a href="/tools">View the complete tool catalog</a></p></div>
-<div class="card"><h2>Session storage</h2><p class="small">Railway's local filesystem is ephemeral. Set <code>MONARCH_MCP_SESSION_DIR=/data/monarch</code> and mount a Railway volume at <code>/data</code> if you want the login to survive redeploys.</p></div>
+<div class="card"><h2>Session storage</h2><p class="small">Railway's local filesystem is ephemeral. Set <code>MONARCH_MCP_SESSION_DIR=/data/monarch</code> and mount a Railway volume at <code>/data</code> to keep the Monarch login, OAuth client registrations, and ChatGPT bearer tokens across redeploys.</p></div>
 <form method="post" action="/logout"><button class="secondary" type="submit">Log out of Monarch</button></form>""",
     )
 
@@ -503,17 +547,18 @@ _mcp_app = mcp.streamable_http_app()
 _mcp_app.routes.insert(0, Route("/health", health, methods=["GET"]))
 _mcp_app.routes.insert(1, Route("/.well-known/oauth-protected-resource", oauth_protected_resource, methods=["GET"]))
 _mcp_app.routes.insert(2, Route("/.well-known/oauth-authorization-server", oauth_server_metadata, methods=["GET"]))
-_mcp_app.routes.insert(3, Route("/oauth/register", oauth_register, methods=["POST"]))
-_mcp_app.routes.insert(4, Route("/oauth/authorize", oauth_authorize, methods=["GET", "POST"]))
-_mcp_app.routes.insert(5, Route("/oauth/token", oauth_token, methods=["POST"]))
-_mcp_app.routes.insert(6, Route("/", home, methods=["GET"]))
-_mcp_app.routes.insert(7, Route("/tools", tools_page, methods=["GET"]))
-_mcp_app.routes.insert(8, Route("/unlock", unlock, methods=["POST"]))
-_mcp_app.routes.insert(9, Route("/auth", auth_page, methods=["GET"]))
-_mcp_app.routes.insert(10, Route("/auth/password", auth_password, methods=["POST"]))
-_mcp_app.routes.insert(11, Route("/auth/cookies", auth_cookies, methods=["POST"]))
-_mcp_app.routes.insert(12, Route("/auth/token", auth_token, methods=["POST"]))
-_mcp_app.routes.insert(13, Route("/logout", logout, methods=["POST"]))
+_mcp_app.routes.insert(3, Route("/.well-known/openid-configuration", oauth_server_metadata, methods=["GET"]))
+_mcp_app.routes.insert(4, Route("/oauth/register", oauth_register, methods=["POST"]))
+_mcp_app.routes.insert(5, Route("/oauth/authorize", oauth_authorize, methods=["GET", "POST"]))
+_mcp_app.routes.insert(6, Route("/oauth/token", oauth_token, methods=["POST"]))
+_mcp_app.routes.insert(7, Route("/", home, methods=["GET"]))
+_mcp_app.routes.insert(8, Route("/tools", tools_page, methods=["GET"]))
+_mcp_app.routes.insert(9, Route("/unlock", unlock, methods=["POST"]))
+_mcp_app.routes.insert(10, Route("/auth", auth_page, methods=["GET"]))
+_mcp_app.routes.insert(11, Route("/auth/password", auth_password, methods=["POST"]))
+_mcp_app.routes.insert(12, Route("/auth/cookies", auth_cookies, methods=["POST"]))
+_mcp_app.routes.insert(13, Route("/auth/token", auth_token, methods=["POST"]))
+_mcp_app.routes.insert(14, Route("/logout", logout, methods=["POST"]))
 _mcp_app.add_middleware(MCPAccessMiddleware)
 app = _mcp_app
 
