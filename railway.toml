@@ -1,0 +1,9 @@
+[build]
+builder = "RAILPACK"
+buildCommand = "uv sync --frozen"
+
+[deploy]
+startCommand = ".venv/bin/python -m monarch_mcp_server.web"
+healthcheckPath = "/health"
+healthcheckTimeout = 30
+restartPolicyType = "ALWAYS"
