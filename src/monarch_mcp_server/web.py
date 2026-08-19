@@ -60,6 +60,15 @@ def _access_code() -> str:
     return os.getenv(_ACCESS_ENV, "").strip()
 
 
+def _external_base_url(request: Request) -> str:
+    """Build the public URL when Railway terminates TLS at its proxy."""
+    forwarded_proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip()
+    forwarded_host = request.headers.get("x-forwarded-host", "").split(",")[0].strip()
+    scheme = forwarded_proto or request.url.scheme
+    host = forwarded_host or request.headers.get("host", request.url.netloc)
+    return f"{scheme}://{host}".rstrip("/")
+
+
 def _sign(value: str) -> str:
     return hmac.new(
         _access_code().encode("utf-8"), value.encode("utf-8"), hashlib.sha256
@@ -124,7 +133,7 @@ class MCPAccessMiddleware(BaseHTTPMiddleware):
                 headers={
                     "WWW-Authenticate": (
                         'Bearer resource_metadata="'
-                        f"{str(request.base_url).rstrip('/')}/.well-known/"
+                        f"{_external_base_url(request)}/.well-known/"
                         'oauth-protected-resource"'
                     )
                 },
@@ -165,7 +174,7 @@ async def health(_: Request) -> JSONResponse:
 
 
 async def oauth_protected_resource(request: Request) -> JSONResponse:
-    base_url = str(request.base_url).rstrip("/")
+    base_url = _external_base_url(request)
     return JSONResponse(
         {
             "resource": f"{base_url}/mcp",
@@ -177,7 +186,7 @@ async def oauth_protected_resource(request: Request) -> JSONResponse:
 
 
 async def oauth_server_metadata(request: Request) -> JSONResponse:
-    base_url = str(request.base_url).rstrip("/")
+    base_url = _external_base_url(request)
     return JSONResponse(
         {
             "issuer": base_url,
@@ -333,7 +342,7 @@ async def home(request: Request) -> HTMLResponse:
         f"""<div class="eyebrow">Monarch MCP</div><h1>Setup dashboard</h1>
 <p>Connect one Monarch account to this Railway service, then point your MCP client at <code>/mcp</code>.</p>
 <div class="card"><h2>Monarch status</h2><p>{_auth_status()}</p><a href="/auth">Open authentication</a></div>
-<div class="card"><h2>MCP connection</h2><p>Endpoint: <code>{html.escape(str(request.base_url).rstrip('/'))}/mcp</code></p><p class="small">For a client that supports custom bearer headers, send <code>Authorization: Bearer &lt;your access code&gt;</code>. Do not configure this server as unauthenticated once it has a Monarch session.</p></div>
+<div class="card"><h2>MCP connection</h2><p>Endpoint: <code>{html.escape(_external_base_url(request))}/mcp</code></p><p class="small">For a client that supports custom bearer headers, send <code>Authorization: Bearer &lt;your access code&gt;</code>. Do not configure this server as unauthenticated once it has a Monarch session.</p></div>
 <div class="card"><h2>Session storage</h2><p class="small">Railway's local filesystem is ephemeral. Set <code>MONARCH_MCP_SESSION_DIR=/data/monarch</code> and mount a Railway volume at <code>/data</code> if you want the login to survive redeploys.</p></div>
 <form method="post" action="/logout"><button class="secondary" type="submit">Log out of Monarch</button></form>""",
     )
