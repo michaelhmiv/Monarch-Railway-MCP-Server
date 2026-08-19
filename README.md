@@ -20,7 +20,7 @@ This repository includes a Railway-friendly HTTP wrapper. It adds a small setup 
 
 1. Deploy the repository to Railway.
 2. Set `MONARCH_MCP_ACCESS_CODE` to a long random value. This is the setup-page password and the bearer token for MCP clients that support custom authorization headers.
-3. Optional but recommended: attach a Railway volume at `/data` and set `MONARCH_MCP_SESSION_DIR=/data/monarch`. Without a volume, Railway's local filesystem is ephemeral and the saved Monarch session can disappear on a redeploy.
+3. Optional but recommended: attach a Railway volume at `/data` and set `MONARCH_MCP_SESSION_DIR=/data/monarch`. This keeps the Monarch login, OAuth client registrations, and ChatGPT bearer tokens across redeploys. Without a volume, Railway's local filesystem is ephemeral and these credentials can disappear on a redeploy.
 4. Open the generated Railway domain, enter the access code, and choose a Monarch authentication method.
 5. Use the MCP endpoint at `https://YOUR-RAILWAY-DOMAIN/mcp`. Keep the endpoint protected; do not configure it as a no-auth public server after connecting a Monarch account.
 6. For OAuth-capable MCP clients, choose OAuth for the remote server. The client will discover the OAuth endpoints automatically; the authorization page asks for the same Railway access code. Clients that support custom headers may instead send `Authorization: Bearer <access code>`.
