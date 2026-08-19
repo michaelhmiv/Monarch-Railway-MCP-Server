@@ -20,7 +20,7 @@ classifiers = [
 ]
 requires-python = ">=3.12,<3.14"
 dependencies = [
-    "mcp[cli]>=1.10.0",
+    "mcp[cli]>=1.10.0,<2",
     "monarchmoneycommunity>=1.4.0",
     "gql>=3.4",
     "keyring>=24.0.0",
@@ -39,12 +39,13 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/robcerda/monarch-mcp-server"
-Repository = "https://github.com/robcerda/monarch-mcp-server"
+Homepage = "https://github.com/michaelhmiv/Monarch-Railway-MCP-Server"
+Repository = "https://github.com/michaelhmiv/Monarch-Railway-MCP-Server"
 Issues = "https://github.com/robcerda/monarch-mcp-server/issues"
 
 [project.scripts]
 monarch-mcp-server = "monarch_mcp_server.server:main"
+monarch-mcp-web = "monarch_mcp_server.web:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
