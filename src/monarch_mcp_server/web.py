@@ -22,13 +22,14 @@ import os
 import secrets
 import time
 from typing import Any
+from urllib.parse import urlencode
 
 import uvicorn
 from monarchmoney import CaptchaRequiredException, RequireMFAException
 from starlette.applications import Starlette
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
+from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
 from starlette.routing import Route
 
 from monarch_mcp_server.app import mcp
@@ -44,6 +45,15 @@ logger = logging.getLogger(__name__)
 _ACCESS_ENV = "MONARCH_MCP_ACCESS_CODE"
 _COOKIE_NAME = "monarch_mcp_session"
 _COOKIE_TTL_SECONDS = 24 * 60 * 60
+_OAUTH_CODE_TTL_SECONDS = 5 * 60
+_OAUTH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60
+
+# OAuth state is intentionally in memory. This is a single-user deployment,
+# and a restart invalidates outstanding OAuth codes/tokens so the client must
+# authorize again. Monarch's own session remains in secure_session storage.
+_oauth_clients: dict[str, set[str]] = {}
+_oauth_codes: dict[str, dict[str, Any]] = {}
+_oauth_tokens: dict[str, float] = {}
 
 
 def _access_code() -> str:
@@ -83,9 +93,18 @@ def _has_access(request: Request) -> bool:
         return True
     authorization = request.headers.get("authorization", "")
     scheme, _, token = authorization.partition(" ")
-    return scheme.lower() == "bearer" and hmac.compare_digest(
-        token.strip(), _access_code()
-    )
+    if scheme.lower() != "bearer":
+        return False
+    token = token.strip()
+    if hmac.compare_digest(token, _access_code()):
+        return True
+    expires_at = _oauth_tokens.get(token)
+    if expires_at is None:
+        return False
+    if expires_at <= time.time():
+        _oauth_tokens.pop(token, None)
+        return False
+    return True
 
 
 class MCPAccessMiddleware(BaseHTTPMiddleware):
@@ -100,9 +119,15 @@ class MCPAccessMiddleware(BaseHTTPMiddleware):
                 )
             return PlainTextResponse(
                 "MCP access required. Unlock the setup page or send "
-                "Authorization: Bearer <access code>.",
+                "Authorization: Bearer <OAuth access token>.",
                 status_code=401,
-                headers={"WWW-Authenticate": 'Bearer realm="Monarch MCP"'},
+                headers={
+                    "WWW-Authenticate": (
+                        'Bearer resource_metadata="'
+                        f"{str(request.base_url).rstrip('/')}/.well-known/"
+                        'oauth-protected-resource"'
+                    )
+                },
             )
         return await call_next(request)
 
@@ -137,6 +162,154 @@ def _auth_status() -> str:
 
 async def health(_: Request) -> JSONResponse:
     return JSONResponse({"ok": True, "service": "monarch-mcp-server"})
+
+
+async def oauth_protected_resource(request: Request) -> JSONResponse:
+    base_url = str(request.base_url).rstrip("/")
+    return JSONResponse(
+        {
+            "resource": f"{base_url}/mcp",
+            "authorization_servers": [base_url],
+            "scopes_supported": ["monarch"],
+            "bearer_methods_supported": ["header"],
+        }
+    )
+
+
+async def oauth_server_metadata(request: Request) -> JSONResponse:
+    base_url = str(request.base_url).rstrip("/")
+    return JSONResponse(
+        {
+            "issuer": base_url,
+            "authorization_endpoint": f"{base_url}/oauth/authorize",
+            "token_endpoint": f"{base_url}/oauth/token",
+            "registration_endpoint": f"{base_url}/oauth/register",
+            "response_types_supported": ["code"],
+            "grant_types_supported": ["authorization_code"],
+            "code_challenge_methods_supported": ["S256"],
+            "scopes_supported": ["monarch"],
+            "token_endpoint_auth_methods_supported": ["none"],
+        }
+    )
+
+
+async def _request_data(request: Request) -> dict[str, Any]:
+    if "application/json" in request.headers.get("content-type", ""):
+        data = await request.json()
+        return data if isinstance(data, dict) else {}
+    form = await request.form()
+    return dict(form)
+
+
+async def oauth_register(request: Request) -> JSONResponse:
+    data = await _request_data(request)
+    redirect_uris = data.get("redirect_uris", [])
+    if isinstance(redirect_uris, str):
+        redirect_uris = [redirect_uris]
+    if not isinstance(redirect_uris, list) or not redirect_uris:
+        return JSONResponse(
+            {"error": "invalid_client_metadata", "error_description": "redirect_uris is required"},
+            status_code=400,
+        )
+    client_id = f"mcp_{secrets.token_urlsafe(18)}"
+    _oauth_clients[client_id] = {str(uri) for uri in redirect_uris}
+    return JSONResponse(
+        {
+            "client_id": client_id,
+            "client_id_issued_at": int(time.time()),
+            "redirect_uris": list(_oauth_clients[client_id]),
+            "token_endpoint_auth_method": "none",
+        },
+        status_code=201,
+    )
+
+
+def _oauth_authorize_page(params: dict[str, str], message: str = "") -> HTMLResponse:
+    hidden = "".join(
+        f'<input type="hidden" name="{html.escape(key)}" value="{html.escape(value)}">'
+        for key, value in params.items()
+        if key != "access_code"
+    )
+    return _page(
+        "Authorize Monarch MCP",
+        f"""<div class="eyebrow">Monarch MCP authorization</div><h1>Authorize access.</h1>
+<p>Your MCP client is requesting access to this private Monarch deployment. Enter the Railway access code to approve the connection.</p>
+<div class="card"><form method="post" action="/oauth/authorize">{hidden}<label for="access_code">Railway access code</label><input id="access_code" name="access_code" type="password" autocomplete="current-password" required autofocus><button type="submit">Approve MCP access</button></form></div>
+<p class="small">This authorizes the MCP connection; Monarch login is completed separately from the <a href="/">setup dashboard</a>.</p>""",
+        message=message,
+    )
+
+
+def _oauth_redirect_error(redirect_uri: str, error: str, state: str | None) -> RedirectResponse:
+    params = {"error": error}
+    if state:
+        params["state"] = state
+    return RedirectResponse(f"{redirect_uri}?{urlencode(params)}", status_code=303)
+
+
+async def oauth_authorize(request: Request) -> Response:
+    data = dict(request.query_params) if request.method == "GET" else await _request_data(request)
+    client_id = str(data.get("client_id", ""))
+    redirect_uri = str(data.get("redirect_uri", ""))
+    state = str(data.get("state", "")) or None
+    if client_id not in _oauth_clients or redirect_uri not in _oauth_clients[client_id]:
+        return _page("Authorize Monarch MCP", "<h1>Invalid OAuth client.</h1>", message="The client or redirect URI was not registered.")
+    if str(data.get("response_type", "")) != "code":
+        return _oauth_redirect_error(redirect_uri, "unsupported_response_type", state)
+    code_challenge = str(data.get("code_challenge", ""))
+    if str(data.get("code_challenge_method", "")) != "S256" or not code_challenge:
+        return _oauth_redirect_error(redirect_uri, "invalid_request", state)
+    if request.method == "GET":
+        if _has_access(request):
+            data["access_code"] = _access_code()
+        else:
+            return _oauth_authorize_page({key: str(value) for key, value in data.items()})
+    elif not _access_code() or not hmac.compare_digest(
+        str(data.get("access_code", "")), _access_code()
+    ):
+        return _oauth_authorize_page(
+            {key: str(value) for key, value in data.items()},
+            "That access code was not accepted.",
+        )
+
+    authorization_code = secrets.token_urlsafe(32)
+    _oauth_codes[authorization_code] = {
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "code_challenge": code_challenge,
+        "scope": str(data.get("scope", "monarch")),
+        "expires_at": time.time() + _OAUTH_CODE_TTL_SECONDS,
+    }
+    params = {"code": authorization_code}
+    if state:
+        params["state"] = state
+    return RedirectResponse(f"{redirect_uri}?{urlencode(params)}", status_code=303)
+
+
+async def oauth_token(request: Request) -> JSONResponse:
+    data = await _request_data(request)
+    if str(data.get("grant_type", "")) != "authorization_code":
+        return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
+    code = str(data.get("code", ""))
+    record = _oauth_codes.pop(code, None)
+    if not record or record["expires_at"] <= time.time():
+        return JSONResponse({"error": "invalid_grant"}, status_code=400)
+    if record["client_id"] != str(data.get("client_id", "")) or record["redirect_uri"] != str(data.get("redirect_uri", "")):
+        return JSONResponse({"error": "invalid_grant"}, status_code=400)
+    verifier = str(data.get("code_verifier", ""))
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    if not verifier or not hmac.compare_digest(challenge, record["code_challenge"]):
+        return JSONResponse({"error": "invalid_grant"}, status_code=400)
+    access_token = f"mcp_{secrets.token_urlsafe(32)}"
+    _oauth_tokens[access_token] = time.time() + _OAUTH_TOKEN_TTL_SECONDS
+    return JSONResponse(
+        {
+            "access_token": access_token,
+            "token_type": "Bearer",
+            "expires_in": _OAUTH_TOKEN_TTL_SECONDS,
+            "scope": record["scope"],
+        }
+    )
 
 
 async def home(request: Request) -> HTMLResponse:
@@ -286,13 +459,18 @@ async def logout(request: Request) -> RedirectResponse:
 
 _mcp_app = mcp.streamable_http_app()
 _mcp_app.routes.insert(0, Route("/health", health, methods=["GET"]))
-_mcp_app.routes.insert(1, Route("/", home, methods=["GET"]))
-_mcp_app.routes.insert(2, Route("/unlock", unlock, methods=["POST"]))
-_mcp_app.routes.insert(3, Route("/auth", auth_page, methods=["GET"]))
-_mcp_app.routes.insert(4, Route("/auth/password", auth_password, methods=["POST"]))
-_mcp_app.routes.insert(5, Route("/auth/cookies", auth_cookies, methods=["POST"]))
-_mcp_app.routes.insert(6, Route("/auth/token", auth_token, methods=["POST"]))
-_mcp_app.routes.insert(7, Route("/logout", logout, methods=["POST"]))
+_mcp_app.routes.insert(1, Route("/.well-known/oauth-protected-resource", oauth_protected_resource, methods=["GET"]))
+_mcp_app.routes.insert(2, Route("/.well-known/oauth-authorization-server", oauth_server_metadata, methods=["GET"]))
+_mcp_app.routes.insert(3, Route("/oauth/register", oauth_register, methods=["POST"]))
+_mcp_app.routes.insert(4, Route("/oauth/authorize", oauth_authorize, methods=["GET", "POST"]))
+_mcp_app.routes.insert(5, Route("/oauth/token", oauth_token, methods=["POST"]))
+_mcp_app.routes.insert(6, Route("/", home, methods=["GET"]))
+_mcp_app.routes.insert(7, Route("/unlock", unlock, methods=["POST"]))
+_mcp_app.routes.insert(8, Route("/auth", auth_page, methods=["GET"]))
+_mcp_app.routes.insert(9, Route("/auth/password", auth_password, methods=["POST"]))
+_mcp_app.routes.insert(10, Route("/auth/cookies", auth_cookies, methods=["POST"]))
+_mcp_app.routes.insert(11, Route("/auth/token", auth_token, methods=["POST"]))
+_mcp_app.routes.insert(12, Route("/logout", logout, methods=["POST"]))
 _mcp_app.add_middleware(MCPAccessMiddleware)
 app = _mcp_app
 
