@@ -32,15 +32,21 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
 from starlette.routing import Route
 
-from monarch_mcp_server.app import mcp
+from monarch_mcp_server.app import configure_tool_metadata, mcp
 from monarch_mcp_server.monarch_auth import (
     EmailOtpRequiredException,
     login_with_browser_cookies,
     login_with_current_auth,
 )
 from monarch_mcp_server.secure_session import secure_session
+from monarch_mcp_server.tool_metadata import tool_catalog
 
 logger = logging.getLogger(__name__)
+
+# ``web.py`` is the production entry point and is imported only after the app
+# and all tool modules are loaded, so this is the safe point to finalize the
+# complete metadata catalog.
+configure_tool_metadata()
 
 _ACCESS_ENV = "MONARCH_MCP_ACCESS_CODE"
 _COOKIE_NAME = "monarch_mcp_session"
@@ -343,8 +349,35 @@ async def home(request: Request) -> HTMLResponse:
 <p>Connect one Monarch account to this Railway service, then point your MCP client at <code>/mcp</code>.</p>
 <div class="card"><h2>Monarch status</h2><p>{_auth_status()}</p><a href="/auth">Open authentication</a></div>
 <div class="card"><h2>MCP connection</h2><p>Endpoint: <code>{html.escape(_external_base_url(request))}/mcp</code></p><p class="small">For a client that supports custom bearer headers, send <code>Authorization: Bearer &lt;your access code&gt;</code>. Do not configure this server as unauthenticated once it has a Monarch session.</p></div>
+<div class="card"><h2>Available tools</h2><p>{len(tool_catalog(mcp))} finance tools are registered and advertised through MCP.</p><p><a href="/tools">View the complete tool catalog</a></p></div>
 <div class="card"><h2>Session storage</h2><p class="small">Railway's local filesystem is ephemeral. Set <code>MONARCH_MCP_SESSION_DIR=/data/monarch</code> and mount a Railway volume at <code>/data</code> if you want the login to survive redeploys.</p></div>
 <form method="post" action="/logout"><button class="secondary" type="submit">Log out of Monarch</button></form>""",
+    )
+
+
+async def tools_page(request: Request) -> HTMLResponse | RedirectResponse:
+    """Show the exact tool metadata advertised by the MCP endpoint."""
+    if not _has_access(request):
+        return RedirectResponse("/", status_code=303)
+    rows = []
+    for item in tool_catalog(mcp):
+        flags = []
+        if item["read_only"]:
+            flags.append("read-only")
+        if item["destructive"]:
+            flags.append("destructive")
+        flag_text = f" <span class=\"small\">({', '.join(flags)})</span>" if flags else ""
+        rows.append(
+            f"<li><strong>{html.escape(item['title'])}</strong> "
+            f"<code>{html.escape(item['name'])}</code>{flag_text}"
+            f"<br><span class=\"small\">{html.escape(item['description'])}</span></li>"
+        )
+    return _page(
+        "Monarch MCP tools",
+        f"""<div class="eyebrow">Monarch MCP</div><h1>Tool catalog</h1>
+<p>This is the same 49-tool catalog returned by <code>tools/list</code>. The title, description, input schema, output schema, and safety annotations are advertised to MCP clients.</p>
+<div class="card"><ol>{''.join(rows)}</ol></div>
+<p><a href="/">Back to dashboard</a></p>""",
     )
 
 
@@ -474,12 +507,13 @@ _mcp_app.routes.insert(3, Route("/oauth/register", oauth_register, methods=["POS
 _mcp_app.routes.insert(4, Route("/oauth/authorize", oauth_authorize, methods=["GET", "POST"]))
 _mcp_app.routes.insert(5, Route("/oauth/token", oauth_token, methods=["POST"]))
 _mcp_app.routes.insert(6, Route("/", home, methods=["GET"]))
-_mcp_app.routes.insert(7, Route("/unlock", unlock, methods=["POST"]))
-_mcp_app.routes.insert(8, Route("/auth", auth_page, methods=["GET"]))
-_mcp_app.routes.insert(9, Route("/auth/password", auth_password, methods=["POST"]))
-_mcp_app.routes.insert(10, Route("/auth/cookies", auth_cookies, methods=["POST"]))
-_mcp_app.routes.insert(11, Route("/auth/token", auth_token, methods=["POST"]))
-_mcp_app.routes.insert(12, Route("/logout", logout, methods=["POST"]))
+_mcp_app.routes.insert(7, Route("/tools", tools_page, methods=["GET"]))
+_mcp_app.routes.insert(8, Route("/unlock", unlock, methods=["POST"]))
+_mcp_app.routes.insert(9, Route("/auth", auth_page, methods=["GET"]))
+_mcp_app.routes.insert(10, Route("/auth/password", auth_password, methods=["POST"]))
+_mcp_app.routes.insert(11, Route("/auth/cookies", auth_cookies, methods=["POST"]))
+_mcp_app.routes.insert(12, Route("/auth/token", auth_token, methods=["POST"]))
+_mcp_app.routes.insert(13, Route("/logout", logout, methods=["POST"]))
 _mcp_app.add_middleware(MCPAccessMiddleware)
 app = _mcp_app
 
