@@ -24,9 +24,17 @@ logger = logging.getLogger(__name__)
 KEYRING_SERVICE = "com.mcp.monarch-mcp-server"
 KEYRING_USERNAME = "monarch-token"
 
-# File-based fallback location
-_TOKEN_DIR = Path.home() / ".monarch-mcp-server"
-_TOKEN_FILE = _TOKEN_DIR / "token"
+# File-based fallback location. Railway users can set
+# MONARCH_MCP_SESSION_DIR to the mount point of a persistent volume.
+_DEFAULT_TOKEN_DIR = Path.home() / ".monarch-mcp-server"
+
+
+def _token_dir() -> Path:
+    return Path(os.getenv("MONARCH_MCP_SESSION_DIR", str(_DEFAULT_TOKEN_DIR)))
+
+
+def _token_file() -> Path:
+    return _token_dir() / "token"
 
 
 _PROBE_USERNAME = "__keyring_probe__"
@@ -71,28 +79,33 @@ class SecureMonarchSession:
     # -- file-based helpers --------------------------------------------------
 
     def _save_token_file(self, token: str) -> None:
-        _TOKEN_DIR.mkdir(parents=True, exist_ok=True)
+        token_dir = _token_dir()
+        token_file = _token_file()
+        token_dir.mkdir(parents=True, exist_ok=True)
         # Write with owner-only permissions
-        _TOKEN_FILE.write_text(token)
-        _TOKEN_FILE.chmod(stat.S_IRUSR | stat.S_IWUSR)  # 600
-        _TOKEN_DIR.chmod(stat.S_IRWXU)  # 700
-        logger.info(f"✅ Token saved to {_TOKEN_FILE}")
+        token_file.write_text(token)
+        token_file.chmod(stat.S_IRUSR | stat.S_IWUSR)  # 600
+        token_dir.chmod(stat.S_IRWXU)  # 700
+        logger.info("✅ Token saved to %s", token_file)
 
     def _load_token_file(self) -> Optional[str]:
-        if _TOKEN_FILE.is_file():
-            token = _TOKEN_FILE.read_text().strip()
+        token_file = _token_file()
+        if token_file.is_file():
+            token = token_file.read_text().strip()
             if token:
-                logger.info(f"✅ Token loaded from {_TOKEN_FILE}")
+                logger.info("✅ Token loaded from %s", token_file)
                 return token
         return None
 
     def _delete_token_file(self) -> None:
-        if _TOKEN_FILE.is_file():
-            _TOKEN_FILE.unlink()
-            logger.info(f"🗑️ Token file deleted: {_TOKEN_FILE}")
+        token_dir = _token_dir()
+        token_file = _token_file()
+        if token_file.is_file():
+            token_file.unlink()
+            logger.info("🗑️ Token file deleted: %s", token_file)
         # Remove directory if empty
-        if _TOKEN_DIR.is_dir() and not list(_TOKEN_DIR.iterdir()):
-            _TOKEN_DIR.rmdir()
+        if token_dir.is_dir() and not list(token_dir.iterdir()):
+            token_dir.rmdir()
 
     # -- public API ----------------------------------------------------------
 
